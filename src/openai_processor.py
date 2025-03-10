@@ -25,6 +25,31 @@ class OpenAIProcessor:
         self.model = os.getenv('OPENAI_MODEL', "o3-mini")
         self.is_o3_model = "o3" in self.model.lower()
         
+        # 初始化 token 計數和成本
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.last_cost = 0.0
+        
+        # 設定模型價格 (每 1,000,000 tokens 的美元價格)
+        # 價格參考: https://openai.com/api/pricing/
+        self.model_prices = {
+            # OpenAI 模型
+            "o3-mini": {"input": 1.10, "output": 4.40},
+        }
+        
+        # 獲取當前模型的價格，如果未定義則使用默認價格
+        model_key = self.model.lower()
+        for key in self.model_prices.keys():
+            if key in model_key:
+                model_key = key
+                break
+        
+        self.current_price = self.model_prices.get(
+            model_key, 
+            {"input": 0.01, "output": 0.02}  # 默認價格
+        )
+        
         print(f"初始化 OpenAI 處理器完成，使用模型: {self.model}")
 
     def process_search_results(self, search_results, prompt_template=None):
@@ -128,10 +153,39 @@ class OpenAIProcessor:
             # 調用 API
             response = self.client.chat.completions.create(**params)
             
+            # 記錄 token 使用量
+            self.last_prompt_tokens = response.usage.prompt_tokens
+            self.last_completion_tokens = response.usage.completion_tokens
+            self.last_total_tokens = response.usage.total_tokens
+            
+            # 計算成本 (美元)
+            input_cost = (self.last_prompt_tokens / 1000000) * self.current_price["input"]
+            output_cost = (self.last_completion_tokens / 1000000) * self.current_price["output"]
+            self.last_cost = input_cost + output_cost
+            
             # 返回結果
             return response.choices[0].message.content
             
         except Exception as e:
             print(f"OpenAI 處理時發生錯誤: {str(e)}")
             print(f"詳細錯誤信息: {e}")
-            return None 
+            # 重置 token 計數和成本
+            self.last_prompt_tokens = 0
+            self.last_completion_tokens = 0
+            self.last_total_tokens = 0
+            self.last_cost = 0.0
+            return None
+            
+    def get_token_usage(self):
+        """
+        獲取最近一次 API 調用的 token 使用量
+        
+        Returns:
+            dict: 包含 token 使用量和成本的字典
+        """
+        return {
+            "prompt_tokens": self.last_prompt_tokens,
+            "completion_tokens": self.last_completion_tokens,
+            "total_tokens": self.last_total_tokens,
+            "cost_usd": self.last_cost
+        } 

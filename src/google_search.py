@@ -26,10 +26,14 @@ class GoogleSearchClient:
             start_index = 1
             
             while len(results) < num_results:
+                # 計算本次需要的結果數量（Google API 每次最多返回 10 個結果）
+                current_num = min(10, num_results - len(results))
+                
                 search_results = self.service.cse().list(
                     q=query,
                     cx=self.cse_id,
-                    start=start_index
+                    start=start_index,
+                    num=current_num  # 添加這個參數指定要返回的結果數量
                 ).execute()
 
                 if 'items' not in search_results:
@@ -46,7 +50,7 @@ class GoogleSearchClient:
                     }
                     results.append(result)
 
-                start_index += 10
+                start_index += current_num  # 更新為實際請求的數量
                 if start_index > 100:  # Google CSE 限制
                     break
 
