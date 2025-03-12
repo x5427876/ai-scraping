@@ -4,6 +4,41 @@ from crawler_client import CrawlerClient
 from openai_processor import OpenAIProcessor
 from dotenv import load_dotenv
 import time
+import re
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import uvicorn
+from crawl4ai import AsyncWebCrawler
+
+# 初始化 FastAPI 應用
+app = FastAPI(
+    title="AI 文章生成 API",
+    description="基於搜尋結果生成 AI 文章的 API 服務",
+    version="1.0.0"
+)
+
+class GenerateArticleRequest(BaseModel):
+    """文章生成請求模型"""
+    keyword: str = Field(..., description="搜尋關鍵字")
+    scraping_number: int = Field(default=10, ge=1, le=50, description="爬取結果數量")
+    isNeedImage: bool = Field(default=True, description="是否需要生成圖片")
+    custom_prompt: Optional[str] = Field(None, description="自定義提示詞")
+    return_json: bool = Field(default=False, description="是否返回 JSON 格式 (默認返回 Markdown 文件)")
+
+class TokenUsage(BaseModel):
+    """Token 使用統計模型"""
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+class GenerateArticleResponse(BaseModel):
+    """文章生成響應模型"""
+    status: str
+    message: str
+    content: str
+    token_usage: TokenUsage
 
 def check_environment():
     """檢查環境變數是否正確設置"""
@@ -17,12 +52,8 @@ def check_environment():
         'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY')
     }
     
-    print("環境變數檢查：")
     missing_vars = []
-    
     for var_name, var_value in required_env_vars.items():
-        status = '已設置' if var_value else '未設置'
-        print(f"{var_name}: {status}")
         if not var_value:
             missing_vars.append(var_name)
     
@@ -31,181 +62,158 @@ def check_environment():
     
     return True
 
-def get_user_input():
-    """
-    獲取使用者輸入的搜尋參數
+def generate_and_insert_image(openai_processor, article_text):
+    """從文章標題生成圖片並將其插入到文章中"""
+    # 從文章中提取標題 (使用 # 開頭的第一行)
+    title_match = re.search(r'^#\s+(.+?)$', article_text, re.MULTILINE)
+    if not title_match:
+        title = "文章主題圖片"
+    else:
+        title = title_match.group(1).strip()
     
-    Returns:
-        tuple: (查詢關鍵字, 結果數量, 爬蟲選項字典)
-    """
-    # 步驟 1: 獲取搜尋關鍵字
-    # -----------------------------
-    query = input("\n請輸入搜尋關鍵字: ")
-    if not query.strip():
-        print("錯誤：搜尋關鍵字不能為空")
-        return None, None, None
+    # 生成圖片提示詞
+    image_prompt = f"為以下標題創建一張高品質、吸引人的圖片，適合作為文章封面：「{title}」。圖片應該視覺上吸引人，與標題主題相關，並具有專業的外觀。請使用明亮、清晰的風格，適合在社交媒體上分享。"
     
-    # 步驟 2: 獲取結果數量
-    # -----------------------------
-    num_results = input("請輸入需要的結果數量 (預設: 10): ")
-    num_results = int(num_results) if num_results.strip() else 10
+    # 調用 OpenAI 生成圖片
+    image_result = openai_processor.generate_image(
+        prompt=image_prompt,
+        size="1792x1024",
+        quality="standard"
+    )
     
-    # 返回標準搜尋策略的參數
-    return query, num_results, {"strategy": "standard"}
+    if not image_result:
+        return article_text
+    
+    # 直接使用 DALL-E 3 提供的圖片 URL
+    image_url = image_result.get("url")
+    if not image_url:
+        return article_text
+    
+    # 創建 Markdown 圖片標記
+    image_markdown = f"\n\n![{title}]({image_url})\n\n"
+    
+    # 在標題後插入圖片
+    if title_match:
+        title_end_pos = title_match.end()
+        modified_article = article_text[:title_end_pos] + image_markdown + article_text[title_end_pos:]
+    else:
+        # 如果找不到標題，則在文章開頭插入圖片
+        modified_article = image_markdown + article_text
+    
+    return modified_article
 
-def display_results(search_results):
-    """
-    格式化搜尋結果列表
-    
-    將搜尋結果格式化為易於閱讀的文本格式，包含標題、網址和內容長度等信息。
-    
-    Args:
-        search_results (list): 搜尋結果列表，每個結果應為包含 title、link 和 content 的字典
-        
-    Returns:
-        str: 格式化的結果字符串，如果沒有結果則返回 None
-    """
-    # 檢查是否有搜尋結果
-    if not search_results:
-        return None
-    
-    # 初始化結果字符串
-    result_str = ""
-    
-    # 遍歷每個搜尋結果並格式化
-    for i, result in enumerate(search_results, 1):
-        # 提取結果信息
-        title = result.get('title', '無標題')
-        link = result.get('link', '無連結')
-        content = result.get('content', '')
-        content_length = len(content)
-        
-        # 格式化單個結果
-        result_str += f"\n{i}. {title}\n"
-        result_str += f"   網址: {link}\n"
-        result_str += f"   內容長度: {content_length:,} 字符\n"
-    
-    return result_str
-
-def main():
-    """主程式入口點"""
+@app.post("/generate_article")
+async def generate_article(request: GenerateArticleRequest):
+    """生成文章的 API 端點"""
     try:
         # 檢查環境設置
         check_environment()
         
-        # 初始化客戶端
-        print("\n正在初始化爬蟲客戶端...")
-        with CrawlerClient() as crawler_client:
-            print("正在初始化 OpenAI 處理器...")
-            openai_processor = OpenAIProcessor()
-            
-            # 獲取使用者輸入
-            query, num_results, crawl_options = get_user_input()
-            if not query:
-                return
-            
+        # 初始化 OpenAI 處理器
+        openai_processor = OpenAIProcessor()
+        
+        # 使用 Google API 直接獲取搜尋結果，不使用 CrawlerClient 的上下文管理器
+        crawler = CrawlerClient()
+        crawler.crawler = AsyncWebCrawler()
+        await crawler.crawler.__aenter__()
+        
+        try:
             # 執行搜尋和爬取
-            print(f"\n正在搜尋並分析 '{query}'...")
-            print("這可能需要一些時間，因為我們需要深入分析每個網頁...")
+            search_results = crawler.get_search_urls(
+                query=request.keyword,
+                num_results=request.scraping_number
+            )
             
-            # 顯示搜尋配置
-            print(f"\n搜尋配置:")
-            print(f"- 結果數量: {num_results}")
+            # 如果 API 搜尋失敗，返回空列表
+            if not search_results:
+                raise HTTPException(status_code=500, detail="搜尋結果為空")
             
-            # 執行標準搜尋
-            search_results = crawler_client.search(query=query, num_results=num_results)
+            # 對每個搜尋結果進行深度爬取
+            enriched_results = []
+            for i, result in enumerate(search_results[:request.scraping_number], 1):
+                try:
+                    print(f"\n處理搜尋結果 {i}/{min(len(search_results), request.scraping_number)}")
+                    
+                    # 爬取頁面內容
+                    crawled_data = await crawler._crawl_url_async(result['link'])
+                    
+                    # 合併結果
+                    enriched_result = {
+                        'title': result['title'],
+                        'link': result['link'],
+                        'snippet': result['snippet'],
+                        'content': crawled_data['content'] if crawled_data['content'] else result['snippet']
+                    }
+                    enriched_results.append(enriched_result)
+                    
+                except Exception as e:
+                    print(f"處理搜尋結果時發生錯誤: {str(e)}")
+                    continue
             
-            # 格式化搜尋結果
-            result_overview = display_results(search_results)
-            if result_overview is None:
-                print("未找到搜尋結果或發生錯誤")
-                return
+            if not enriched_results:
+                raise HTTPException(status_code=500, detail="爬取結果為空")
             
             # 使用 OpenAI 處理結果
-            print("\n正在使用 AI 進行深度分析...")
-            analysis = openai_processor.process_search_results(search_results)
+            analysis = openai_processor.process_search_results(
+                enriched_results,
+                request.custom_prompt
+            )
             
-            # 獲取 token 使用量和成本
+            if not analysis:
+                raise HTTPException(status_code=500, detail="文章生成失敗")
+            
+            # 根據 isNeedImage 參數決定是否生成圖片
+            if request.isNeedImage:
+                analysis = generate_and_insert_image(openai_processor, analysis)
+            
+            # 獲取 token 使用量
             token_usage = openai_processor.get_token_usage()
             
-            # 顯示搜尋結果和分析結果
+            # 確保內容不包含原始的 \n 字符
             if analysis:
-                # 定義分隔線和標題格式
-                separator = "=" * 60
-                section_separator = "-" * 50
-                
-                # 顯示主標題
-                print(f"\n{separator}")
-                print(f"   AI 分析結果: '{query}'")
-                print(f"{separator}")
-                
-                # 顯示 token 使用量和成本
-                print(f"\n【API 使用統計】")
-                print(section_separator)
-                print(f"模型: {openai_processor.model}")
-                print(f"輸入 tokens: {token_usage['prompt_tokens']:,}")
-                print(f"輸出 tokens: {token_usage['completion_tokens']:,}")
-                print(f"總計 tokens: {token_usage['total_tokens']:,}")
-                print(f"成本: ${token_usage['cost_usd']:.6f} USD")
-                print(section_separator)
-                
-                # 顯示 AI 分析部分
-                print(f"\n【AI 分析結果】")
-                print(section_separator)
-                print(analysis)
-                print(section_separator)
-                
-                # 保存結果到文件選項
-                save_option = input("\n是否要保存分析結果到文件？(y/n): ")
-                if save_option.lower() == 'y':
-                    # 生成文件名
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    safe_query = query.replace(' ', '_').replace('/', '_').replace('\\', '_')[:30]
-                    filename = f"analysis_{safe_query}_{timestamp}.txt"
-                    
-                    # 寫入文件
-                    try:
-                        with open(filename, 'w', encoding='utf-8') as f:
-                            # 寫入標題和基本信息
-                            f.write(f"{separator}\n")
-                            f.write(f"   AI 分析結果: '{query}'\n")
-                            f.write(f"{separator}\n\n")
-                            
-                            f.write(f"搜尋時間: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                            f.write(f"搜尋關鍵字: {query}\n")
-                            f.write(f"結果數量: {num_results}\n\n")
-                            
-                            # 寫入 token 使用量和成本
-                            f.write(f"【API 使用統計】\n")
-                            f.write(f"{section_separator}\n")
-                            f.write(f"模型: {openai_processor.model}\n")
-                            f.write(f"輸入 tokens: {token_usage['prompt_tokens']:,}\n")
-                            f.write(f"輸出 tokens: {token_usage['completion_tokens']:,}\n")
-                            f.write(f"總計 tokens: {token_usage['total_tokens']:,}\n")
-                            f.write(f"成本: ${token_usage['cost_usd']:.6f} USD\n")
-                            f.write(f"{section_separator}\n\n")
-                            
-                            # 寫入分析結果
-                            f.write(f"【AI 分析結果】\n")
-                            f.write(f"{section_separator}\n")
-                            f.write(analysis + "\n")
-                            f.write(f"{section_separator}\n")
-                        
-                        print(f"\n✓ 分析結果已成功保存到: {filename}")
-                    except Exception as e:
-                        print(f"\n✗ 保存文件時發生錯誤: {str(e)}")
+                analysis = re.sub(r'\\n+', '', analysis)
+            
+            # 根據 return_json 參數決定返回格式
+            if request.return_json:
+                # 返回 JSON 格式
+                return GenerateArticleResponse(
+                    status="success",
+                    message="文章生成成功",
+                    content=analysis,
+                    token_usage=TokenUsage(
+                        prompt_tokens=token_usage["prompt_tokens"],
+                        completion_tokens=token_usage["completion_tokens"],
+                        total_tokens=token_usage["total_tokens"],
+                        cost_usd=token_usage["cost_usd"]
+                    )
+                )
             else:
-                print("AI 分析過程中發生錯誤")
+                # 返回 Markdown 文件
+                # 生成文件名
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                safe_query = request.keyword.replace(' ', '_').replace('/', '_').replace('\\', '_')[:30]
+                filename = f"article_{safe_query}_{timestamp}.md"
                 
+                # 設置響應頭，使瀏覽器將其作為文件下載
+                headers = {
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Content-Type': 'text/markdown; charset=utf-8'
+                }
+                
+                # 直接返回 Markdown 內容
+                return Response(content=analysis, headers=headers)
+        finally:
+            # 確保爬蟲資源被釋放
+            if crawler.crawler:
+                await crawler.crawler.__aexit__(None, None, None)
+        
     except ValueError as ve:
-        print(f"\n配置錯誤: {str(ve)}")
-    except KeyboardInterrupt:
-        print("\n程式已被使用者中斷")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        print(f"\n程式執行時發生錯誤：{str(e)}")
         import traceback
-        print("\n詳細錯誤訊息：")
+        print(f"生成文章時發生錯誤: {str(e)}")
         print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    main() 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 

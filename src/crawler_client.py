@@ -24,6 +24,7 @@ class CrawlerClient:
         
         # Crawl4AI 爬蟲實例
         self.crawler = None
+        self.loop = None
     
     async def __aenter__(self):
         """異步上下文管理器進入方法"""
@@ -38,15 +39,27 @@ class CrawlerClient:
     
     def __enter__(self):
         """同步上下文管理器進入方法 (創建事件循環並運行異步進入方法)"""
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        # 檢查是否已經有事件循環
+        try:
+            self.loop = asyncio.get_event_loop()
+            if self.loop.is_closed():
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+        except RuntimeError:
+            # 如果沒有事件循環，創建一個新的
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+        
+        # 運行異步進入方法
         self.loop.run_until_complete(self.__aenter__())
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """同步上下文管理器退出方法 (運行異步退出方法並關閉事件循環)"""
-        self.loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))
-        self.loop.close()
+        if self.loop:
+            self.loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))
+            # 不要關閉事件循環，因為它可能是由 FastAPI 創建的
+            # self.loop.close()
     
     def _init_google_api(self):
         """初始化 Google API 客戶端"""
@@ -229,264 +242,4 @@ class CrawlerClient:
             print(f"爬取 URL 時發生錯誤 ({url}): {str(e)}")
             import traceback
             print(traceback.format_exc())
-            return {'content': '', 'title': url, 'links': [], 'images': [], 'date': '', 'author': '', 'tags': []}
-    
-    def crawl_url(self, url: str) -> Dict[str, any]:
-        """
-        同步包裝的 URL 爬取方法
-        
-        Args:
-            url (str): 要爬取的 URL
-            
-        Returns:
-            dict: 爬取結果
-        """
-        return self.loop.run_until_complete(self._crawl_url_async(url))
-
-    def search(self, query: str, num_results: int = 10) -> List[Dict[str, str]]:
-        """
-        結合 Google API 和 Crawl4AI 進行搜尋
-        
-        Args:
-            query (str): 搜尋關鍵字
-            num_results (int): 需要返回的結果數量
-            
-        Returns:
-            list: 搜尋結果列表
-        """
-        try:
-            # 首先使用 Google API 獲取搜尋結果
-            search_results = self.get_search_urls(query, num_results)
-            
-            # 如果 API 搜尋失敗，使用備用的爬蟲方法
-            if not search_results:
-                print("使用備用爬蟲方法...")
-                search_results = self._fallback_search(query, num_results)
-            
-            # 對每個搜尋結果進行深度爬取
-            enriched_results = []
-            for i, result in enumerate(search_results[:num_results], 1):
-                try:
-                    print(f"\n處理搜尋結果 {i}/{min(len(search_results), num_results)}")
-                    
-                    # 爬取頁面內容
-                    crawled_data = self.crawl_url(result['link'])
-                    
-                    # 合併結果
-                    enriched_result = {
-                        'title': result['title'],
-                        'link': result['link'],
-                        'snippet': result['snippet'],
-                        'content': crawled_data['content'] if crawled_data['content'] else result['snippet']
-                    }
-                    enriched_results.append(enriched_result)
-                    
-                except Exception as e:
-                    print(f"處理搜尋結果時發生錯誤: {str(e)}")
-                    continue
-            
-            return enriched_results
-            
-        except Exception as e:
-            print(f"搜尋過程中發生錯誤: {str(e)}")
-            return []
-    
-    async def _search_with_bfs_async(self, query: str, max_pages: int = 10, max_depth: int = 2, initial_results_count: int = 10) -> List[Dict[str, str]]:
-        """
-        使用 BFS 策略進行異步搜尋和爬取
-        
-        BFS (廣度優先搜尋) 策略從初始搜尋結果開始，逐層探索相關頁面，
-        直到達到指定的最大頁面數或最大深度。
-        
-        Args:
-            query (str): 搜尋關鍵字
-            max_pages (int): 最大爬取頁面數
-            max_depth (int): 最大爬取深度
-            initial_results_count (int): 初始搜尋結果數量
-            
-        Returns:
-            list: 搜尋結果列表，每個結果包含標題、連結、摘要和內容
-        """
-        try:
-            # 步驟 1: 初始化和參數日誌
-            # ---------------------------
-            print(f"\n開始 BFS 搜尋:")
-            print(f"- 關鍵字: '{query}'")
-            print(f"- 初始結果數量: {initial_results_count}")
-            print(f"- 最大頁面數: {max_pages}")
-            print(f"- 最大深度: {max_depth}")
-            
-            # 步驟 2: 獲取初始搜尋結果
-            # ---------------------------
-            print("\n正在獲取初始搜尋結果...")
-            initial_results = self.get_search_urls(query, min(initial_results_count, max_pages))
-            if not initial_results:
-                print("無法獲取初始搜尋結果，搜尋終止")
-                return []
-            
-            print(f"成功獲取 {len(initial_results)} 個初始搜尋結果")
-            
-            # 步驟 3: 初始化 BFS 所需的數據結構
-            # ---------------------------
-            queue = deque()        # 待爬取的 URL 隊列
-            visited = set()        # 已爬取的 URL 集合
-            results = []           # 爬取結果列表
-            url_to_depth = {}      # URL 對應的深度映射
-            
-            # 步驟 4: 將初始搜尋結果加入隊列
-            # ---------------------------
-            print("\n正在初始化 BFS 隊列...")
-            for result in initial_results:
-                url = result['link']
-                queue.append(url)
-                url_to_depth[url] = 0  # 初始深度為 0
-            
-            print(f"初始化完成，隊列中有 {len(queue)} 個 URL 等待爬取")
-            
-            # 步驟 5: 執行 BFS 爬取
-            # ---------------------------
-            print("\n開始 BFS 爬取過程...")
-            
-            while queue and len(results) < max_pages:
-                # 5.1 從隊列中取出下一個 URL
-                current_url = queue.popleft()
-                current_depth = url_to_depth[current_url]
-                
-                # 5.2 檢查是否已訪問過
-                if current_url in visited:
-                    continue
-                
-                # 5.3 標記為已訪問
-                visited.add(current_url)
-                
-                # 5.4 爬取當前 URL
-                print(f"\n正在爬取 ({len(results)+1}/{max_pages}): {current_url}")
-                print(f"- 當前深度: {current_depth}")
-                
-                crawled_data = await self._crawl_url_async(current_url)
-                
-                # 5.5 處理爬取結果
-                if crawled_data['content']:
-                    # 創建結果對象
-                    result = {
-                        'title': crawled_data.get('title', current_url),
-                        'link': current_url,
-                        'snippet': crawled_data['content'][:200] + "...",
-                        'content': crawled_data['content']
-                    }
-                    
-                    # 添加到結果列表
-                    results.append(result)
-                    print(f"✓ 成功添加結果 {len(results)}/{max_pages}")
-                else:
-                    print("✗ 未能提取有效內容，跳過")
-                
-                # 5.6 處理下一層連結 (如果未達到最大深度)
-                if current_depth < max_depth:
-                    next_depth = current_depth + 1
-                    links = crawled_data.get('links', [])
-                    
-                    new_links_count = 0
-                    for link in links:
-                        if link not in visited and link not in queue:
-                            queue.append(link)
-                            url_to_depth[link] = next_depth
-                            new_links_count += 1
-                    
-                    if new_links_count > 0:
-                        print(f"- 添加了 {new_links_count} 個新連結到隊列 (深度: {next_depth})")
-                    else:
-                        print("- 未發現新連結")
-            
-            # 步驟 6: 完成 BFS 搜尋
-            # ---------------------------
-            total_visited = len(visited)
-            print(f"\nBFS 搜尋完成:")
-            print(f"- 共爬取 {total_visited} 個頁面")
-            print(f"- 獲取 {len(results)} 個有效結果")
-            
-            return results
-            
-        except Exception as e:
-            print(f"\nBFS 搜尋過程中發生錯誤:")
-            print(f"- 錯誤類型: {type(e).__name__}")
-            print(f"- 錯誤訊息: {str(e)}")
-            
-            # 輸出詳細的錯誤堆疊
-            import traceback
-            print("\n詳細錯誤堆疊:")
-            traceback.print_exc()
-            
-            # 如果已經有部分結果，返回這些結果
-            if results:
-                print(f"\n儘管發生錯誤，仍返回已獲取的 {len(results)} 個結果")
-                return results
-            
-            return []
-    
-    def search_with_bfs(self, query: str, max_pages: int = 10, max_depth: int = 2, initial_results_count: int = 10) -> List[Dict[str, str]]:
-        """
-        使用 BFS 策略進行搜尋和爬取 (同步包裝)
-        
-        Args:
-            query (str): 搜尋關鍵字
-            max_pages (int): 最大爬取頁面數
-            max_depth (int): 最大爬取深度
-            initial_results_count (int): 初始搜尋結果數量
-            
-        Returns:
-            list: 搜尋結果列表
-        """
-        return self.loop.run_until_complete(self._search_with_bfs_async(query, max_pages, max_depth, initial_results_count))
-    
-    def _fallback_search(self, query: str, num_results: int) -> List[Dict[str, str]]:
-        """備用的搜尋方法 (直接使用 Crawl4AI 搜尋)"""
-        try:
-            print(f"使用 Crawl4AI 直接搜尋: {query}")
-            
-            # 構建搜尋 URL
-            encoded_query = quote_plus(query)
-            search_url = f"https://www.google.com/search?q={encoded_query}&num={num_results}"
-            
-            # 使用 Crawl4AI 爬取搜尋結果頁面
-            crawled_data = self.crawl_url(search_url)
-            
-            # 從爬取結果中提取搜尋結果
-            search_results = []
-            
-            # 簡單解析 markdown 內容，提取標題和連結
-            lines = crawled_data['content'].split('\n')
-            current_title = None
-            current_link = None
-            
-            for line in lines:
-                line = line.strip()
-                if line.startswith('# ') or line.startswith('## '):
-                    # 如果有之前的結果，添加到列表
-                    if current_title and current_link:
-                        search_results.append({
-                            'title': current_title,
-                            'link': current_link,
-                            'snippet': ''  # 無法從 markdown 中提取摘要
-                        })
-                    
-                    # 開始新的結果
-                    current_title = line.lstrip('#').strip()
-                    current_link = None
-                elif line.startswith('http') and current_title:
-                    current_link = line
-            
-            # 添加最後一個結果
-            if current_title and current_link and len(search_results) < num_results:
-                search_results.append({
-                    'title': current_title,
-                    'link': current_link,
-                    'snippet': ''
-                })
-            
-            print(f"備用搜尋完成，找到 {len(search_results)} 個結果")
-            return search_results[:num_results]
-            
-        except Exception as e:
-            print(f"備用搜尋過程中發生錯誤: {str(e)}")
-            return [] 
+            return {'content': '', 'title': url, 'links': [], 'images': [], 'date': '', 'author': '', 'tags': []} 

@@ -49,4 +49,7 @@ htmlcov/
 
 # 爬蟲緩存
 .playwright-cache/
-browser_data/ 
+browser_data/
+
+# 生成的圖片
+images/ 
